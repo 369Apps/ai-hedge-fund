@@ -41,7 +41,9 @@ class DataClient(Protocol):
     backtests, because missing data is indistinguishable from "no signal".
 
     get_financial_metrics must be point-in-time: return only data that was
-    publicly filed by *end_date*, not data whose fiscal period ended by then.
+    publicly filed by *end_date*. A fiscal period end is not that date —
+    the filing lands weeks later — and a missing filing_date does not make
+    an old period private.
     """
 
     def get_prices(
