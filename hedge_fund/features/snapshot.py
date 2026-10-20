@@ -2,9 +2,10 @@
 
 A `FundamentalsSnapshot` is everything an investor agent is allowed to know
 about a company as of a given date: a history of financial metrics (each row
-provably public by `as_of` — the data layer filters on filing_date, not
-report_period) plus a few derived aggregates computed here in Python so the
-LLM reasons over facts instead of re-deriving arithmetic.
+provably public by `as_of` — a filing date on or before that day, or an
+older archive row whose filing was never linked) plus a few derived
+aggregates computed here in Python so the LLM reasons over facts instead of
+re-deriving arithmetic.
 
 The snapshot is pure data: build it once, hash it, feed it to any persona.
 `content_hash` is the cache key for LLM calls — an agent only re-reasons

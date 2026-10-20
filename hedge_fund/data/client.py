@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import date, timedelta
 
 import requests
 
@@ -20,6 +21,16 @@ from hedge_fund.data.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A 10-K can land up to 90 days after the period ends. An undated metrics
+# row (the deep-history archive never linked a filing_date) is public only
+# once that window has passed, so a quarter that just ended cannot leak
+# into a backtest.
+_UNDATED_PUBLIC_LAG_DAYS = 92
+
+# One not-yet-public quarter, plus a restatement of a period we keep.
+# `limit` stays a count of public periods when the history is there.
+_METRICS_FETCH_HEADROOM = 4
 
 
 class FDClientError(Exception):
@@ -113,20 +124,33 @@ class FDClient:
     ) -> list[FinancialMetrics]:
         """Fetch financial metrics that were PUBLIC as of *end_date*.
 
-        Point-in-time: filters on ``filing_date`` (when the SEC filing was
-        accepted, ET) — not ``report_period`` (the fiscal period end, which
-        precedes public availability by 3-6 weeks and would leak the future
-        into a backtest). Rows without a known filing_date are excluded
-        server-side, so everything returned was provably knowable on
-        *end_date*.
+        Point-in-time, and the deep history still counts. The query is
+        bounded by ``report_period`` so archive rows whose SEC filing was
+        never linked (``filing_date`` is null) come back at all. A period
+        end is not the day the numbers became public — the filing lags it
+        by weeks — so each row is kept only when it was already knowable:
+
+        - ``filing_date`` on or before *end_date*, or
+        - no ``filing_date``, and the period ended long enough ago that
+          the 10-Q/10-K would already be on EDGAR.
+
+        ``filing_date_lte`` cannot express that. The server drops every
+        unlinked row, and a long-listed name comes back with only the few
+        recent periods that happen to carry a filing date. One row per
+        ``report_period``: a restatement keeps the latest filing that was
+        already public. ``limit`` is how many of those periods to return.
         """
+        as_of = end_date[:10]
         data = self._get("/financial-metrics/", {
             "ticker": ticker,
-            "filing_date_lte": end_date,
+            "report_period_lte": as_of,
             "period": period,
-            "limit": limit,
+            "limit": limit + _METRICS_FETCH_HEADROOM,
         }, response_key="financial_metrics")
-        return [FinancialMetrics(**row) for row in data] if data else []
+        if not data:
+            return []
+        chosen = _select_public_periods(data, as_of)[:limit]
+        return [FinancialMetrics(**row) for row in chosen]
 
     # ------------------------------------------------------------------
     # News
@@ -310,3 +334,41 @@ class FDClient:
             f"{method} {path} rate limited (429) after {len(self._RETRY_DELAYS)} retries",
             status_code=429, path=path,
         )
+
+
+def _select_public_periods(rows: list[dict], end_date: str) -> list[dict]:
+    """Periods knowable on *end_date*, one row each, in the order given.
+
+    The API lists newest report periods first. Two rows for the same
+    period (a filing and its amendment) collapse to the later public
+    filing; an undated row loses to a dated one.
+    """
+    as_of = date.fromisoformat(end_date[:10])
+    as_of_text = as_of.isoformat()
+    undated_cutoff = (as_of - timedelta(days=_UNDATED_PUBLIC_LAG_DAYS)).isoformat()
+    best: dict[str, tuple[str, dict]] = {}
+    order: list[str] = []
+    for row in rows:
+        period = row.get("report_period")
+        if not isinstance(period, str) or len(period) < 10:
+            continue
+        period_day = period[:10]
+        if period_day > as_of_text:
+            continue
+        filing = row.get("filing_date")
+        filing_day = filing[:10] if isinstance(filing, str) and len(filing) >= 10 else None
+        if filing_day is not None:
+            if filing_day > as_of_text:
+                continue
+            rank = filing_day
+        elif period_day > undated_cutoff:
+            continue
+        else:
+            rank = ""
+        current = best.get(period_day)
+        if current is None:
+            order.append(period_day)
+            best[period_day] = (rank, row)
+        elif rank > current[0]:
+            best[period_day] = (rank, row)
+    return [best[period][1] for period in order]

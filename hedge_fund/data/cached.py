@@ -78,7 +78,12 @@ class CachedDataClient:
     def get_financial_metrics(self, ticker, end_date, period="ttm", limit=10):
         return self._cached_list(
             "get_financial_metrics", FinancialMetrics,
-            {"ticker": ticker, "end_date": end_date, "period": period, "limit": limit},
+            # `selection` is part of the key so a disk entry from the old
+            # filing_date_lte query — which dropped undated history and
+            # left long-listed names looking like they had three periods —
+            # is not served forever.
+            {"ticker": ticker, "end_date": end_date, "period": period, "limit": limit,
+             "selection": "public-period-v2"},
             lambda: self._client.get_financial_metrics(ticker, end_date, period, limit),
         )
 

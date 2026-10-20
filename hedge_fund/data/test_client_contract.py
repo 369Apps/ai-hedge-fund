@@ -5,15 +5,17 @@ Pins the two Phase 0 guarantees:
 1. Fail-loud: infrastructure failures RAISE FDClientError instead of
    silently returning empty (silent empties poison backtests — missing
    data reads as "no signal").
-2. Point-in-time: get_financial_metrics filters on filing_date (when the
-   data became public), not report_period (which leaks 3-6 weeks of
-   future into a backtest).
+2. Point-in-time: get_financial_metrics returns only periods that were
+   public by end_date. The query uses report_period so archive rows with
+   no filing_date are not dropped by the server; the client then drops
+   anything not yet filed. A fiscal period end alone is not public.
 """
 
 import pytest
 import requests
 
 from hedge_fund.data import FDClient, FDClientError
+from hedge_fund.features.snapshot import build_snapshot, InsufficientData
 
 
 class _FakeResponse:
@@ -106,16 +108,92 @@ def test_429_then_success_recovers(client, monkeypatch):
 # Point-in-time contract
 # ---------------------------------------------------------------------------
 
-def test_financial_metrics_filters_on_filing_date(client):
-    """The metrics query must use filing_date_lte (public-knowledge date),
-    never report_period_lte (fiscal period end = lookahead leak)."""
+def test_financial_metrics_query_keeps_undated_archive_rows(client):
+    """filing_date_lte drops every row whose filing was never linked, which
+    is most of a long TTM history. Ask by report period instead, and ask
+    for a few extra rows so dropping one unfiled quarter still fills `limit`."""
     calls = _stub(client, [_FakeResponse(200, {"financial_metrics": []})])
 
     client.get_financial_metrics("AAPL", "2024-06-30", period="ttm", limit=4)
 
     params = calls[0]["params"]
-    assert params["filing_date_lte"] == "2024-06-30"
-    assert "report_period_lte" not in params
+    assert params["report_period_lte"] == "2024-06-30"
+    assert params["period"] == "ttm"
+    assert params["limit"] > 4
+    assert "filing_date_lte" not in params
+
+
+def _metric_row(report_period, filing_date, market_cap):
+    return {
+        "ticker": "MU",
+        "report_period": report_period,
+        "period": "ttm",
+        "filing_date": filing_date,
+        "market_cap": market_cap,
+    }
+
+
+class _SnapshotClient:
+    """FDClient for metrics; facts stay empty so no second HTTP call."""
+
+    def __init__(self, fd: FDClient):
+        self._fd = fd
+
+    def get_financial_metrics(self, ticker, end_date, period="ttm", limit=10):
+        return self._fd.get_financial_metrics(ticker, end_date, period, limit)
+
+    def get_company_facts(self, ticker):
+        return None
+
+
+def test_undated_archive_periods_count_and_unfiled_ones_do_not(client):
+    """The MU failure: three recent TTM rows carry a filing_date and the
+    rest of a long history does not. As of 2026-09-19 that used to be
+    "only 3 filed periods (need 4)". The undated older rows are public
+    history. A filing after as-of, and an undated period that just ended,
+    still do not count. Two rows for one period count once, and the later
+    public filing wins."""
+    rows = [
+        _metric_row("2026-08-31", "2026-09-25", 1),  # filed after as-of
+        _metric_row("2026-08-01", None, 2),          # ended too recently to assume filed
+        _metric_row("2026-05-31", "2026-06-10", 3),  # earlier filing of this period
+        _metric_row("2026-05-31", "2026-06-25", 4),  # later public filing wins
+        _metric_row("2026-02-28", "2026-03-20", 5),
+        _metric_row("2025-11-30", "2025-12-20", 6),
+        _metric_row("2025-08-31", None, 7),
+        _metric_row("2025-05-31", None, 8),
+        _metric_row("2025-05-31", None, 9),          # same undated period, keep the first
+    ]
+    payload = {"financial_metrics": rows}
+    _stub(client, [_FakeResponse(200, payload), _FakeResponse(200, payload)])
+
+    metrics = client.get_financial_metrics("MU", "2026-09-19", period="ttm", limit=20)
+
+    assert [(m.report_period, m.market_cap, m.filing_date) for m in metrics] == [
+        ("2026-05-31", 4, "2026-06-25"),
+        ("2026-02-28", 5, "2026-03-20"),
+        ("2025-11-30", 6, "2025-12-20"),
+        ("2025-08-31", 7, None),
+        ("2025-05-31", 8, None),
+    ]
+    snap = build_snapshot("MU", "2026-09-19", _SnapshotClient(client))
+    assert [p.report_period for p in snap.periods] == [m.report_period for m in metrics]
+
+
+def test_three_public_periods_still_raise(client):
+    """A name that really has only three public periods still abstains.
+    The minimum did not move; the count of what is public did."""
+    rows = [
+        _metric_row("2026-08-31", "2026-10-01", 1),
+        _metric_row("2026-08-01", None, 2),
+        _metric_row("2026-05-31", "2026-06-25", 3),
+        _metric_row("2026-02-28", "2026-03-20", 4),
+        _metric_row("2025-11-30", "2025-12-20", 5),
+    ]
+    _stub(client, [_FakeResponse(200, {"financial_metrics": rows})])
+
+    with pytest.raises(InsufficientData, match="only 3 filed periods"):
+        build_snapshot("MU", "2026-09-19", _SnapshotClient(client))
 
 
 # ---------------------------------------------------------------------------
